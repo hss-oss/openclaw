@@ -24,6 +24,7 @@ import { resolveProviderTransportTurnStateWithPlugin } from "../plugins/provider
 import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./copilot-dynamic-headers.js";
 import { detectOpenAICompletionsCompat } from "./openai-completions-compat.js";
 import { flattenCompletionMessagesToStringContent } from "./openai-completions-string-content.js";
+import { planTurnInput } from "./openai-responses-message-conversion.js";
 import {
   applyOpenAIResponsesPayloadPolicy,
   resolveOpenAIResponsesPayloadPolicy,
@@ -39,6 +40,39 @@ import { transformTransportMessages } from "./transport-message-transform.js";
 import { mergeTransportMetadata, sanitizeTransportPayloadText } from "./transport-stream-shared.js";
 
 const DEFAULT_AZURE_OPENAI_API_VERSION = "2024-12-01-preview";
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Per-session  state for SSE incremental传输
+// ─────────────────────────────────────────────────────────────────────────────
+
+interface SseSession {
+  /** 上一次请求的 response_id */
+  previousResponseId: string | null;
+  /** 上一次请求时 context.messages 的长度 */
+  lastContextLength: number;
+}
+
+/** Module-level registry: sessionId → SseSession */
+const sseRegistry = new Map<string, SseSession>();
+
+function getOrCreateSseSession(sessionId: string): SseSession {
+  let session = sseRegistry.get(sessionId);
+  if (!session) {
+    session = {
+      previousResponseId: null,
+      lastContextLength: 0,
+    };
+    sseRegistry.set(sessionId, session);
+  }
+  return session;
+}
+
+/**
+ * 释放 SSE session 状态
+ */
+export function releaseSseSession(sessionId: string): void {
+  sseRegistry.delete(sessionId);
+}
 
 type OpenAIReasoningEffort = "minimal" | "low" | "medium" | "high" | "xhigh";
 
@@ -665,6 +699,12 @@ export function createOpenAIResponsesTransportStreamFn(): StreamFn {
         stopReason: "stop",
         timestamp: Date.now(),
       };
+
+      // 获取或创建 session 状态
+      const sessionId = options?.sessionId;
+      const session = sessionId ? getOrCreateSseSession(sessionId) : null;
+      const capturedContextLength = context.messages.length;
+
       try {
         const apiKey = options?.apiKey || getEnvApiKey(model.provider) || "";
         const turnState = resolveProviderTransportTurnState(model, {
@@ -685,6 +725,12 @@ export function createOpenAIResponsesTransportStreamFn(): StreamFn {
           context,
           options as OpenAIResponsesOptions,
           turnState?.metadata,
+          session
+            ? {
+                previousResponseId: session.previousResponseId,
+                lastContextLength: session.lastContextLength,
+              }
+            : undefined,
         );
         const nextParams = await options?.onPayload?.(params, model);
         if (nextParams !== undefined) {
@@ -700,6 +746,13 @@ export function createOpenAIResponsesTransportStreamFn(): StreamFn {
           serviceTier: (options as OpenAIResponsesOptions | undefined)?.serviceTier,
           applyServiceTierPricing,
         });
+
+        // 请求完成后更新 session 状态
+        if (session && output.responseId) {
+          session.previousResponseId = output.responseId;
+          session.lastContextLength = capturedContextLength;
+        }
+
         if (options?.signal?.aborted) {
           throw new Error("Request was aborted");
         }
@@ -748,26 +801,65 @@ export function buildOpenAIResponsesParams(
   context: Context,
   options: OpenAIResponsesOptions | undefined,
   metadata?: Record<string, string>,
+  incrementalOptions?: {
+    previousResponseId: string | null;
+    lastContextLength: number;
+  },
 ) {
   const compat = getCompat(model as OpenAIModeModel);
   const supportsDeveloperRole =
     typeof compat.supportsDeveloperRole === "boolean" ? compat.supportsDeveloperRole : undefined;
-  const messages = convertResponsesMessages(
-    model,
-    context,
-    new Set(["openai", "openai-codex", "opencode", "azure-openai-responses"]),
-    { supportsDeveloperRole },
-  );
+
+  // 使用增量传输模式（如果提供了 previousResponseId）
+  let messages: ResponseInput;
+  if (incrementalOptions?.previousResponseId && incrementalOptions.lastContextLength > 0) {
+    const turnInput = planTurnInput({
+      context,
+      model: { input: model.input },
+      previousResponseId: incrementalOptions.previousResponseId,
+      lastContextLength: incrementalOptions.lastContextLength,
+    });
+    messages = turnInput.inputItems as unknown as ResponseInput;
+  } else {
+    messages = convertResponsesMessages(
+      model,
+      context,
+      new Set(["openai", "openai-codex", "opencode", "azure-openai-responses"]),
+      { supportsDeveloperRole },
+    );
+  }
+
   const cacheRetention = resolveCacheRetention(options?.cacheRetention);
   const payloadPolicy = resolveOpenAIResponsesPayloadPolicy(model, {
     storeMode: "disable",
   });
+
+  // 构建 previous_response_id（仅在增量传输模式且有 tool result 时使用）
+  let previousResponseId: string | undefined;
+  if (incrementalOptions?.previousResponseId && incrementalOptions.lastContextLength > 0) {
+    const turnInput = planTurnInput({
+      context,
+      model: { input: model.input },
+      previousResponseId: incrementalOptions.previousResponseId,
+      lastContextLength: incrementalOptions.lastContextLength,
+    });
+    if (turnInput.mode === "incremental_tool_results") {
+      previousResponseId = turnInput.previousResponseId ?? undefined;
+    }
+  }
+
   const params: OpenAIResponsesRequestParams = {
     model: model.id,
     input: messages,
     stream: true,
-    prompt_cache_key: cacheRetention === "none" ? undefined : options?.sessionId,
-    prompt_cache_retention: getPromptCacheRetention(model.baseUrl, cacheRetention),
+    ...(previousResponseId ? { previous_response_id: previousResponseId } : {}),
+    // previous_response_id 模式和 prompt_cache_key 互斥，只在非增量传输时使用 cache
+    prompt_cache_key:
+      previousResponseId || cacheRetention === "none" ? undefined : options?.sessionId,
+    prompt_cache_retention:
+      previousResponseId || cacheRetention === "none"
+        ? undefined
+        : getPromptCacheRetention(model.baseUrl, cacheRetention),
     ...(metadata ? { metadata } : {}),
   };
   if (options?.maxTokens) {
